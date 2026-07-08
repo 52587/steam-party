@@ -1,10 +1,5 @@
 {
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/index" }
-  ],
-  "build": {
-    "env": {
-      "PYTHON_VERSION": "3.11"
-    }
-  }
+  ]
 }
