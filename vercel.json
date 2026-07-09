@@ -1,8 +1,4 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "env": {
-    "DEEPSEEK_API_KEY": "@deepseek_api_key"
-  },
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/index" }
   ]
