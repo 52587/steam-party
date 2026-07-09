@@ -18,7 +18,11 @@ import httpx
 
 
 STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "4A8CB88E2B47982AB099C17E4E56420A")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "YOUR_DEEPSEEK_API_KEY")
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
 CACHE_TTL_SECONDS = 300
+AI_MATCH_DESCS = {"完美匹配", "非常匹配", "比较匹配", "还行"}
 
 SESSIONS: dict[str, dict] = {}
 API_CACHE: dict[str, tuple[dict, float]] = {}
@@ -61,6 +65,212 @@ async def steam_call(endpoint: str, params: dict[str, str]) -> dict:
             del API_CACHE[stale_key]
 
     return data
+
+
+def is_deepseek_configured() -> bool:
+    key = DEEPSEEK_API_KEY.strip()
+    return bool(key) and key not in {"YOUR_DEEPSEEK_API_KEY", "PLACEHOLDER"} and not key.startswith("@")
+
+
+def player_top_games(player: dict, limit: int = 20) -> list[dict]:
+    games = list(player.get("game_dict", {}).values())
+    games.sort(
+        key=lambda game: (game.get("hours", 0), game.get("hours_2weeks", 0)),
+        reverse=True,
+    )
+    return games[:limit]
+
+
+def owned_game_names(players: dict[str, dict]) -> set[str]:
+    names = set()
+    for player in players.values():
+        for game in player.get("game_dict", {}).values():
+            name = game.get("name", "").strip().lower()
+            if name:
+                names.add(name)
+    return names
+
+
+def build_ai_prompt(players: dict[str, dict]) -> str:
+    player_sections = []
+    owned_names = sorted({
+        game.get("name", "").strip()
+        for player in players.values()
+        for game in player.get("game_dict", {}).values()
+        if game.get("name", "").strip()
+    })
+
+    for idx, player in enumerate(players.values(), start=1):
+        top_games = player_top_games(player, 20)
+        game_lines = [
+            f"  - {game['name']}：{game.get('hours', 0)} 小时"
+            for game in top_games
+        ]
+        player_sections.append(
+            "\n".join([
+                f"玩家 {idx}：{player['name']}",
+                f"游戏总数：{player.get('game_count', len(player.get('game_dict', {})))}",
+                "最常玩的游戏：",
+                *game_lines,
+            ])
+        )
+
+    owned_list_for_prompt = "、".join(owned_names[:600])
+    if len(owned_names) > 600:
+        owned_list_for_prompt += f"、……（共 {len(owned_names)} 款，后端会继续按完整库过滤）"
+
+    return f"""你是一个懂 Steam 多人游戏和合作游戏的中文游戏推荐专家。
+
+请基于以下玩家的 Steam 游戏库数据，分析每位玩家的偏好，包括常玩的类型、核心机制、游戏节奏、合作/竞技倾向、硬核程度和美术/叙事偏好。然后给整个小队推荐 5-8 款适合多人联机或合作游玩的 Steam 游戏。
+
+重要限制：
+1. 推荐游戏必须适合多人联机、合作或同屏/线上多人游玩。
+2. 不要推荐任何玩家已经拥有的游戏，尤其不要推荐下方“已拥有游戏排除名单”中的游戏。
+3. 推荐理由要结合不同玩家的偏好，解释为什么适合整个小队。
+4. 只返回合法 JSON，不要返回 Markdown，不要返回额外解释。
+5. match_score 必须是 0-100 的整数。
+6. match_desc 只能是以下四个值之一："完美匹配"、"非常匹配"、"比较匹配"、"还行"。
+
+玩家数据：
+{chr(10).join(player_sections)}
+
+已拥有游戏排除名单：
+{owned_list_for_prompt}
+
+请严格返回以下 JSON 数组结构：
+[
+  {{
+    "name": "Game Name",
+    "reason": "为什么要推荐这个游戏的详细理由",
+    "match_score": 85,
+    "match_desc": "非常匹配"
+  }}
+]"""
+
+
+def extract_json_array(content: str) -> list:
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        raise ApiError("AI 返回内容不是有效的 JSON 数组", 502)
+
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as exc:
+        raise ApiError(f"AI 返回 JSON 解析失败: {exc}", 502) from exc
+
+    if not isinstance(parsed, list):
+        raise ApiError("AI 返回内容不是推荐列表", 502)
+    return parsed
+
+
+def normalize_ai_recommendations(raw_items: list, owned_names: set[str]) -> list[dict]:
+    recommendations = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("name", "")).strip()
+        if not name or name.lower() in owned_names:
+            continue
+
+        reason = str(item.get("reason", "")).strip()
+        if not reason:
+            reason = "这款游戏与小队的整体游玩偏好较匹配，适合作为下一款联机游戏尝试。"
+
+        try:
+            match_score = int(item.get("match_score", 0))
+        except (TypeError, ValueError):
+            match_score = 0
+        match_score = max(0, min(100, match_score))
+
+        match_desc = str(item.get("match_desc", "")).strip()
+        if match_desc not in AI_MATCH_DESCS:
+            if match_score >= 90:
+                match_desc = "完美匹配"
+            elif match_score >= 80:
+                match_desc = "非常匹配"
+            elif match_score >= 65:
+                match_desc = "比较匹配"
+            else:
+                match_desc = "还行"
+
+        recommendations.append({
+            "name": name,
+            "reason": reason,
+            "match_score": match_score,
+            "match_desc": match_desc,
+        })
+
+        if len(recommendations) >= 8:
+            break
+
+    return recommendations
+
+
+async def generate_ai_recommendations(session: dict) -> list[dict]:
+    if not is_deepseek_configured():
+        raise ApiError("DeepSeek API Key 未配置，请在环境变量 DEEPSEEK_API_KEY 中设置后重试。", 503)
+
+    players = session.get("players", {})
+    if len(players) < 2:
+        raise ApiError("Need at least 2 players")
+
+    prompt = build_ai_prompt(players)
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是一个专业、克制、了解 Steam 多人游戏生态的中文游戏推荐助手，只输出合法 JSON。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1800,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                DEEPSEEK_API_URL,
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:200] if exc.response is not None else ""
+        raise ApiError(f"DeepSeek API 请求失败: {detail or exc}", 502) from exc
+    except httpx.HTTPError as exc:
+        raise ApiError("DeepSeek API 请求失败，请稍后重试。", 502) from exc
+    except json.JSONDecodeError as exc:
+        raise ApiError("DeepSeek API 返回内容不是有效 JSON", 502) from exc
+
+    choices = data.get("choices") or []
+    content = ""
+    if choices:
+        content = choices[0].get("message", {}).get("content", "")
+    if not content:
+        raise ApiError("DeepSeek API 没有返回推荐内容", 502)
+
+    raw_recommendations = extract_json_array(content)
+    recommendations = normalize_ai_recommendations(raw_recommendations, owned_game_names(players))
+    if not recommendations:
+        raise ApiError("AI 没有生成可用的未拥有游戏推荐，请重试。", 502)
+    return recommendations
 
 
 async def resolve_steam_id(raw: str) -> str:
@@ -312,6 +522,7 @@ async def handle_api(method: str, path: str, query: dict[str, list[str]], body: 
                 "player_count": len(players),
                 "locked": session.get("locked", False),
                 "has_results": "results" in session,
+                "has_ai_recommendations": "ai_recommendations" in session,
             }
 
         if method == "POST" and path.startswith("/api/session/") and path.endswith("/analyze"):
@@ -326,6 +537,33 @@ async def handle_api(method: str, path: str, query: dict[str, list[str]], body: 
             results = analyze_group(session["players"])
             session["results"] = results
             return 200, {"status": "ok", **results}
+
+        if method == "POST" and path.startswith("/api/session/") and path.endswith("/ai-recommend"):
+            session_id = path.split("/")[3]
+            session = SESSIONS.get(session_id)
+            if not session:
+                raise ApiError("Session not found", 404)
+
+            if "ai_recommendations" not in session:
+                session["ai_recommendations"] = await generate_ai_recommendations(session)
+
+            return 200, {
+                "status": "ok",
+                "recommendations": session["ai_recommendations"],
+            }
+
+        if method == "GET" and path.startswith("/api/session/") and path.endswith("/ai-recommendations"):
+            session_id = path.split("/")[3]
+            session = SESSIONS.get(session_id)
+            if not session:
+                raise ApiError("Session not found", 404)
+            if "ai_recommendations" not in session:
+                raise ApiError("No AI recommendations yet", 404)
+
+            return 200, {
+                "status": "ok",
+                "recommendations": session["ai_recommendations"],
+            }
 
         if method == "GET" and path.startswith("/api/session/") and path.endswith("/results"):
             session_id = path.split("/")[3]

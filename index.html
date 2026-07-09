@@ -147,6 +147,33 @@
   .tag-own { background: rgba(76,175,132,0.2); color: var(--success) }
   .tag-miss { background: rgba(224,85,85,0.2); color: var(--danger) }
 
+  /* AI recommendations */
+  .ai-actions { text-align: center; padding: 18px 0 }
+  .ai-card {
+    background: var(--chip); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px; margin-bottom: 10px;
+  }
+  .ai-card-head {
+    display: flex; justify-content: space-between; gap: 12px;
+    align-items: flex-start; margin-bottom: 10px;
+  }
+  .ai-game-name { font-weight: 700; font-size: 1em; line-height: 1.35 }
+  .ai-badge {
+    flex: 0 0 auto; padding: 3px 9px; border-radius: 999px;
+    background: rgba(102,126,234,0.18); color: #b7c1ff; font-size: 0.78em;
+  }
+  .score-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px }
+  .score-num { width: 42px; color: var(--accent); font-weight: 700; font-size: 0.9em }
+  .score-bar {
+    flex: 1; height: 8px; overflow: hidden; border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+  }
+  .score-fill { height: 100%; border-radius: inherit }
+  .score-high { background: linear-gradient(90deg, #4caf84, #8bdc65) }
+  .score-mid { background: linear-gradient(90deg, #e0ad4f, #f2d36b) }
+  .score-low { background: linear-gradient(90deg, #e05555, #ee8b71) }
+  .ai-reason { color: #cfcfe6; font-size: 0.9em; line-height: 1.65 }
+
   /* Pair cards */
   .pair-card {
     background: var(--chip); border-radius: var(--radius); padding: 14px; margin-bottom: 10px;
@@ -240,11 +267,13 @@
       <div class="tab active" data-tab="common" onclick="switchTab('common')">共同游戏</div>
       <div class="tab" data-tab="recs" onclick="switchTab('recs')">推荐补票</div>
       <div class="tab" data-tab="pairs" onclick="switchTab('pairs')">双人交集</div>
+      <div class="tab" data-tab="ai" onclick="switchTab('ai')">AI推荐</div>
     </div>
     <div class="card" style="border-top:none;border-radius:0 0 var(--radius) var(--radius)">
       <div id="tab-common"></div>
       <div id="tab-recs" style="display:none"></div>
       <div id="tab-pairs" style="display:none"></div>
+      <div id="tab-ai" style="display:none"></div>
     </div>
     <button class="btn btn-primary" onclick="copyShare(this)" style="margin-top:12px">复制链接分享结果</button>
   </div>
@@ -255,6 +284,10 @@
 let sessionId = null;
 let results = null;
 let pollTimer = null;
+let aiRecommendations = null;
+let aiLoading = false;
+let aiError = '';
+let aiCacheChecked = false;
 
 // ─── URL detection (joining via shared link) ───
 const urlParams = new URLSearchParams(window.location.search);
@@ -298,6 +331,13 @@ function updateShareUrl() {
   document.getElementById('share-url').textContent = getShareUrl();
 }
 
+function resetAiState() {
+  aiRecommendations = null;
+  aiLoading = false;
+  aiError = '';
+  aiCacheChecked = false;
+}
+
 // ─── API calls ───
 async function api(method, path, body) {
   const opts = { method, headers: {} };
@@ -328,6 +368,7 @@ async function createSession() {
   try {
     const data = await api('POST', '/api/session/create', { steam_id: steamId });
     sessionId = data.session_id;
+    resetAiState();
     hideAll();
     // Show share
     updateShareUrl();
@@ -350,6 +391,7 @@ async function joinSession() {
 
   try {
     await api('POST', '/api/session/' + sessionId + '/join', { steam_id: steamId });
+    resetAiState();
     hideAll();
     updateShareUrl();
     document.getElementById('step-share').style.display = 'block';
@@ -463,6 +505,80 @@ function renderResults() {
         '</div>'
       ).join('')
     : '<div class="empty">无数据</div>';
+
+  renderAiTab();
+  loadCachedAiRecommendations();
+}
+
+// ─── AI Recommendations ───
+async function loadCachedAiRecommendations() {
+  if (aiCacheChecked || !sessionId) return;
+  aiCacheChecked = true;
+  try {
+    const data = await api('GET', '/api/session/' + sessionId + '/ai-recommendations');
+    aiRecommendations = data.recommendations || [];
+    aiError = '';
+  } catch (e) {
+    // 404 just means the session has no cached AI result yet.
+  }
+  renderAiTab();
+}
+
+async function requestAiRecommendations() {
+  if (!sessionId || aiLoading) return;
+  aiLoading = true;
+  aiError = '';
+  renderAiTab();
+
+  try {
+    const data = await api('POST', '/api/session/' + sessionId + '/ai-recommend');
+    aiRecommendations = data.recommendations || [];
+    aiCacheChecked = true;
+  } catch (e) {
+    aiError = e.message;
+  } finally {
+    aiLoading = false;
+    renderAiTab();
+  }
+}
+
+function renderAiTab() {
+  const el = document.getElementById('tab-ai');
+  if (!el) return;
+
+  if (aiLoading) {
+    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" disabled><span class="spinner"></span> AI 正在分析...</button></div>';
+    return;
+  }
+
+  if (aiError) {
+    el.innerHTML =
+      '<div class="error-msg" style="display:block;margin-top:0">' + escapeHtml(aiError) + '</div>' +
+      '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations()">重试 AI 推荐</button></div>';
+    return;
+  }
+
+  const recs = aiRecommendations || [];
+  if (!recs.length) {
+    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations()">使用AI智能推荐</button></div>';
+    return;
+  }
+
+  el.innerHTML = recs.map(r => {
+    const score = clampScore(r.match_score);
+    const scoreClass = score >= 80 ? 'score-high' : (score >= 60 ? 'score-mid' : 'score-low');
+    return '<div class="ai-card">' +
+      '<div class="ai-card-head">' +
+      '<div class="ai-game-name">' + escapeHtml(r.name) + '</div>' +
+      '<span class="ai-badge">' + escapeHtml(r.match_desc || '比较匹配') + '</span>' +
+      '</div>' +
+      '<div class="score-row">' +
+      '<span class="score-num">' + score + '</span>' +
+      '<div class="score-bar"><div class="score-fill ' + scoreClass + '" style="width:' + score + '%"></div></div>' +
+      '</div>' +
+      '<div class="ai-reason">' + escapeHtml(r.reason || '') + '</div>' +
+      '</div>';
+  }).join('');
 }
 
 // ─── Tabs ───
@@ -472,6 +588,8 @@ function switchTab(name) {
   document.getElementById('tab-common').style.display = name === 'common' ? 'block' : 'none';
   document.getElementById('tab-recs').style.display = name === 'recs' ? 'block' : 'none';
   document.getElementById('tab-pairs').style.display = name === 'pairs' ? 'block' : 'none';
+  document.getElementById('tab-ai').style.display = name === 'ai' ? 'block' : 'none';
+  if (name === 'ai') loadCachedAiRecommendations();
 }
 
 // ─── Copy ───
@@ -507,6 +625,12 @@ function escapeHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+function clampScore(value) {
+  const score = parseInt(value, 10);
+  if (Number.isNaN(score)) return 0;
+  return Math.max(0, Math.min(100, score));
 }
 </script>
 </body>
