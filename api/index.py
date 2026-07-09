@@ -376,8 +376,41 @@ class App:
             body += message.get("body", b"")
             more_body = message.get("more_body", False)
 
+        # Serve index.html for root and /s/ routes (SPA)
+        if path == "/" or path.startswith("/s/"):
+            await self._serve_static(send, "index.html")
+            return
+
         status, result = await handle_api(method, path, query, body)
         await self._send_json(send, status, headers, result)
+
+    async def _serve_static(self, send, filename: str):
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            filepath = os.path.join(os.path.dirname(script_dir), filename)
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            body = content.encode("utf-8")
+            response_headers = {
+                "content-type": "text/html; charset=utf-8",
+                "content-length": str(len(body)),
+                "cache-control": "public, max-age=0, must-revalidate",
+            }
+        except FileNotFoundError:
+            body = b"Not Found"
+            response_headers = {
+                "content-type": "text/plain",
+                "content-length": "9",
+            }
+        await send({
+            "type": "http.response.start",
+            "status": 200 if body != b"Not Found" else 404,
+            "headers": [
+                (key.encode("ascii"), value.encode("ascii"))
+                for key, value in response_headers.items()
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
 
     async def _send_json(self, send, status: int, headers: dict[str, str], data: dict):
         response_body = b"" if status == 204 else json.dumps(data, ensure_ascii=False).encode("utf-8")
