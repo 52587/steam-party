@@ -6,6 +6,17 @@ const cache = {};
 const CACHE_TTL = 300_000;
 
 function cacheKey(...parts) { return parts.join("::"); }
+function roundSteamMinutes(minutes) { return Math.round(((minutes || 0) / 60) * 10) / 10; }
+function parseFormBody(body) { return Object.fromEntries(new URLSearchParams(body || "")); }
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", chunk => data += chunk);
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
 
 async function steamCall(endpoint, params) {
   const key = cacheKey(endpoint, JSON.stringify(Object.entries(params).sort()));
@@ -51,8 +62,8 @@ async function fetchPlayer(steamId) {
     gameDict[g.appid] = {
       appid: g.appid,
       name: g.name || `App ${g.appid}`,
-      hours: Math.round((g.playtime_forever || 0) / 6) / 10,
-      hours_2weeks: Math.round((g.playtime_2weeks || 0) / 6) / 10,
+      hours: roundSteamMinutes(g.playtime_forever),
+      hours_2weeks: roundSteamMinutes(g.playtime_2weeks),
       last_played: g.rtime_last_played || 0,
       img_icon: g.img_icon_url || "",
     };
@@ -129,13 +140,7 @@ function analyzeGroup(players) {
 // ─── Router ───────────────────────────────────────────
 
 async function route(method, path, body) {
-  let form = {};
-  if (body) {
-    for (const pair of body.split("&")) {
-      const [k, v] = pair.split("=");
-      if (k) form[decodeURIComponent(k)] = decodeURIComponent(v || "");
-    }
-  }
+  const form = parseFormBody(body);
 
   try {
     // POST /api/session/create
@@ -216,17 +221,19 @@ export default async function handler(req, res) {
     return res.status(204).end();
   }
 
-  const path = req.url.split("?")[0];
+  const requestUrl = new URL(req.url, "http://localhost");
+  const routedPath = requestUrl.searchParams.get("__path");
+  const path = routedPath ? `/api/${routedPath.replace(/^\/+/, "")}` : requestUrl.pathname;
   const method = req.method;
 
   // Read body
   let body = "";
   if (method === "POST") {
-    body = await new Promise((resolve) => {
-      let data = "";
-      req.on("data", chunk => data += chunk);
-      req.on("end", () => resolve(data));
-    });
+    try {
+      body = await readRequestBody(req);
+    } catch {
+      return res.status(400).json({ error: "Failed to read request body" });
+    }
   }
 
   const [status, data] = await route(method, path, body);
