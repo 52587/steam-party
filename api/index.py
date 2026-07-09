@@ -13,14 +13,19 @@ import secrets
 import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
+from urllib.parse import urlsplit
 
 import httpx
 
 
 STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "4A8CB88E2B47982AB099C17E4E56420A")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "YOUR_DEEPSEEK_API_KEY")
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_API_URLS = (
+    "https://api.deepseek.com.cn/v1/chat/completions",
+    "https://api.deepseek.com/v1/chat/completions",
+)
 DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_TIMEOUT = httpx.Timeout(40.0, connect=10.0, read=30.0)
 CACHE_TTL_SECONDS = 300
 AI_MATCH_DESCS = {"完美匹配", "非常匹配", "比较匹配", "还行"}
 
@@ -70,6 +75,47 @@ async def steam_call(endpoint: str, params: dict[str, str]) -> dict:
 def is_deepseek_configured() -> bool:
     key = DEEPSEEK_API_KEY.strip()
     return bool(key) and key not in {"YOUR_DEEPSEEK_API_KEY", "PLACEHOLDER"} and not key.startswith("@")
+
+
+def deepseek_base_url(api_url: str) -> str:
+    parsed = urlsplit(api_url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def describe_deepseek_connection_error(exc: httpx.HTTPError) -> str:
+    detail = str(exc) or exc.__class__.__name__
+    cause = getattr(exc, "__cause__", None)
+    if cause:
+        detail = f"{detail}; cause={cause}"
+
+    lower_detail = detail.lower()
+    if isinstance(exc, httpx.ConnectTimeout):
+        reason = "连接超时"
+    elif isinstance(exc, httpx.ReadTimeout):
+        reason = "读取超时"
+    elif isinstance(exc, httpx.TimeoutException):
+        reason = "请求超时"
+    elif isinstance(exc, httpx.ConnectError) and any(
+        marker in lower_detail
+        for marker in (
+            "name or service not known",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+            "dns",
+            "getaddrinfo",
+        )
+    ):
+        reason = "DNS 解析失败"
+    elif isinstance(exc, httpx.ConnectError):
+        reason = "连接失败"
+    else:
+        reason = "网络错误"
+
+    return f"{reason}: {detail}"
+
+
+async def test_deepseek_connection(client: httpx.AsyncClient, api_url: str) -> None:
+    await client.get(deepseek_base_url(api_url))
 
 
 def player_top_games(player: dict, limit: int = 20) -> list[dict]:
@@ -239,25 +285,44 @@ async def generate_ai_recommendations(session: dict) -> list[dict]:
         "max_tokens": 1800,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                DEEPSEEK_API_URL,
-                headers={
-                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:200] if exc.response is not None else ""
-        raise ApiError(f"DeepSeek API 请求失败: {detail or exc}", 502) from exc
-    except httpx.HTTPError as exc:
-        raise ApiError("DeepSeek API 请求失败，请稍后重试。", 502) from exc
-    except json.JSONDecodeError as exc:
-        raise ApiError("DeepSeek API 返回内容不是有效 JSON", 502) from exc
+    connection_errors = []
+    async with httpx.AsyncClient(timeout=DEEPSEEK_TIMEOUT) as client:
+        for api_url in DEEPSEEK_API_URLS:
+            try:
+                await test_deepseek_connection(client, api_url)
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                connection_errors.append(
+                    f"{deepseek_base_url(api_url)} 连接测试失败 ({describe_deepseek_connection_error(exc)})"
+                )
+                continue
+
+            try:
+                resp = await client.post(
+                    api_url,
+                    headers={
+                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.text[:200] if exc.response is not None else ""
+                raise ApiError(f"DeepSeek API HTTP 状态错误: {detail or exc}", 502) from exc
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                connection_errors.append(
+                    f"{api_url} 请求连接失败 ({describe_deepseek_connection_error(exc)})"
+                )
+                continue
+            except httpx.HTTPError as exc:
+                raise ApiError(f"DeepSeek API 请求失败: {exc}", 502) from exc
+            except json.JSONDecodeError as exc:
+                raise ApiError("DeepSeek API 返回内容不是有效 JSON", 502) from exc
+        else:
+            detail = "；".join(connection_errors) or "没有可用端点"
+            raise ApiError(f"DeepSeek API 连接失败，所有端点均不可达: {detail}", 502)
 
     choices = data.get("choices") or []
     content = ""
