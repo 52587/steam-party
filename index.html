@@ -288,6 +288,9 @@ let aiRecommendations = null;
 let aiLoading = false;
 let aiError = '';
 let aiCacheChecked = false;
+let aiAutoRetrySeconds = 0;
+let aiAutoRetryTimer = null;
+let aiLastRequestRefresh = false;
 
 // ─── URL detection (joining via shared link) ───
 const urlParams = new URLSearchParams(window.location.search);
@@ -332,10 +335,12 @@ function updateShareUrl() {
 }
 
 function resetAiState() {
+  clearAiAutoRetryTimer();
   aiRecommendations = null;
   aiLoading = false;
   aiError = '';
   aiCacheChecked = false;
+  aiLastRequestRefresh = false;
 }
 
 // ─── API calls ───
@@ -525,46 +530,63 @@ async function loadCachedAiRecommendations() {
 }
 
 async function requestAiRecommendations() {
+  const options = arguments[0] || {};
   if (!sessionId || aiLoading) return;
+  clearAiAutoRetryTimer();
+  const refresh = options.refresh === true;
+  const allowAutoRetry = options.autoRetry !== false;
+  aiLastRequestRefresh = refresh;
   aiLoading = true;
   aiError = '';
   renderAiTab();
 
   try {
-    const data = await api('POST', '/api/session/' + sessionId + '/ai-recommend');
+    const path = '/api/session/' + sessionId + '/ai-recommend' + (refresh ? '?refresh=true' : '');
+    const data = await api('POST', path);
     aiRecommendations = data.recommendations || [];
     aiCacheChecked = true;
   } catch (e) {
-    aiError = e.message;
-  } finally {
     aiLoading = false;
+    if (allowAutoRetry) {
+      scheduleAiAutoRetry(refresh);
+    } else {
+      aiError = e.message;
+    }
     renderAiTab();
+    return;
   }
+
+  aiLoading = false;
+  renderAiTab();
+}
+
+function clearAiAutoRetryTimer() {
+  if (aiAutoRetryTimer) clearInterval(aiAutoRetryTimer);
+  aiAutoRetryTimer = null;
+  aiAutoRetrySeconds = 0;
+}
+
+function scheduleAiAutoRetry(refresh) {
+  aiError = '';
+  aiAutoRetrySeconds = 3;
+  renderAiTab();
+  aiAutoRetryTimer = setInterval(() => {
+    aiAutoRetrySeconds -= 1;
+    if (aiAutoRetrySeconds <= 0) {
+      clearAiAutoRetryTimer();
+      requestAiRecommendations({ refresh, autoRetry: false });
+    } else {
+      renderAiTab();
+    }
+  }, 1000);
 }
 
 function renderAiTab() {
   const el = document.getElementById('tab-ai');
   if (!el) return;
 
-  if (aiLoading) {
-    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" disabled><span class="spinner"></span> AI 正在分析...</button></div>';
-    return;
-  }
-
-  if (aiError) {
-    el.innerHTML =
-      '<div class="error-msg" style="display:block;margin-top:0">' + escapeHtml(aiError) + '</div>' +
-      '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations()">重试 AI 推荐</button></div>';
-    return;
-  }
-
   const recs = aiRecommendations || [];
-  if (!recs.length) {
-    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations()">使用AI智能推荐</button></div>';
-    return;
-  }
-
-  el.innerHTML = recs.map(r => {
+  const cardsHtml = recs.map(r => {
     const score = clampScore(r.match_score);
     const scoreClass = score >= 80 ? 'score-high' : (score >= 60 ? 'score-mid' : 'score-low');
     return '<div class="ai-card">' +
@@ -579,6 +601,39 @@ function renderAiTab() {
       '<div class="ai-reason">' + escapeHtml(r.reason || '') + '</div>' +
       '</div>';
   }).join('');
+
+  if (aiLoading && !recs.length) {
+    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" disabled><span class="spinner"></span> AI 正在分析...</button></div>';
+    return;
+  }
+
+  if (aiLoading) {
+    el.innerHTML = cardsHtml +
+      '<div class="ai-actions"><button class="btn btn-primary" disabled><span class="spinner"></span> AI 正在重新推荐...</button></div>';
+    return;
+  }
+
+  if (aiAutoRetrySeconds > 0) {
+    el.innerHTML = cardsHtml +
+      '<div class="ai-actions"><button class="btn btn-primary" disabled>连接中，请稍候... ' + aiAutoRetrySeconds + ' 秒后自动重试</button></div>';
+    return;
+  }
+
+  if (aiError) {
+    el.innerHTML =
+      cardsHtml +
+      '<div class="error-msg" style="display:block;margin-top:0">' + escapeHtml(aiError) + '</div>' +
+      '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations({ refresh: aiLastRequestRefresh })">重试 AI 推荐</button></div>';
+    return;
+  }
+
+  if (!recs.length) {
+    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations()">使用AI智能推荐</button></div>';
+    return;
+  }
+
+  el.innerHTML = cardsHtml +
+    '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations({ refresh: true })">换一批</button></div>';
 }
 
 // ─── Tabs ───

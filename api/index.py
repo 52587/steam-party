@@ -28,6 +28,7 @@ DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_TIMEOUT = httpx.Timeout(40.0, connect=10.0, read=30.0)
 CACHE_TTL_SECONDS = 300
 AI_MATCH_DESCS = {"完美匹配", "非常匹配", "比较匹配", "还行"}
+AI_TEMPERATURES = (0.7, 0.9, 1.0)
 
 SESSIONS: dict[str, dict] = {}
 API_CACHE: dict[str, tuple[dict, float]] = {}
@@ -263,7 +264,19 @@ def normalize_ai_recommendations(raw_items: list, owned_names: set[str]) -> list
     return recommendations
 
 
-async def generate_ai_recommendations(session: dict) -> list[dict]:
+def query_flag(query: dict[str, list[str]], name: str) -> bool:
+    value = query.get(name, [""])[-1].strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def next_ai_temperature(session: dict) -> float:
+    index = session.get("ai_recommend_temperature_index", 0)
+    temperature = AI_TEMPERATURES[index % len(AI_TEMPERATURES)]
+    session["ai_recommend_temperature_index"] = index + 1
+    return temperature
+
+
+async def generate_ai_recommendations(session: dict, temperature: float = 0.7) -> list[dict]:
     if not is_deepseek_configured():
         raise ApiError("DeepSeek API Key 未配置，请在环境变量 DEEPSEEK_API_KEY 中设置后重试。", 503)
 
@@ -281,7 +294,7 @@ async def generate_ai_recommendations(session: dict) -> list[dict]:
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.7,
+        "temperature": temperature,
         "max_tokens": 1800,
     }
 
@@ -587,7 +600,7 @@ async def handle_api(method: str, path: str, query: dict[str, list[str]], body: 
                 "player_count": len(players),
                 "locked": session.get("locked", False),
                 "has_results": "results" in session,
-                "has_ai_recommendations": "ai_recommendations" in session,
+                "has_ai_recommendations": bool(session.get("ai_recommendations")),
             }
 
         if method == "POST" and path.startswith("/api/session/") and path.endswith("/analyze"):
@@ -609,8 +622,21 @@ async def handle_api(method: str, path: str, query: dict[str, list[str]], body: 
             if not session:
                 raise ApiError("Session not found", 404)
 
+            refresh = query_flag(query, "refresh") or form.get("refresh", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if refresh:
+                session.pop("ai_recommendations", None)
+
             if "ai_recommendations" not in session:
-                session["ai_recommendations"] = await generate_ai_recommendations(session)
+                temperature = next_ai_temperature(session)
+                session["ai_recommendations"] = await generate_ai_recommendations(
+                    session,
+                    temperature=temperature,
+                )
 
             return 200, {
                 "status": "ok",
