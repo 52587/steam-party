@@ -221,9 +221,7 @@ export default async function handler(req, res) {
     return res.status(204).end();
   }
 
-  const requestUrl = new URL(req.url, "http://localhost");
-  const routedPath = requestUrl.searchParams.get("__path");
-  const path = routedPath ? `/api/${routedPath.replace(/^\/+/, "")}` : requestUrl.pathname;
+  const path = req.url.split("?")[0];
   const method = req.method;
 
   // Read body
