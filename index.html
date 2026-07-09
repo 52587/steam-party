@@ -208,7 +208,7 @@
     <p style="color:var(--muted);margin-bottom:8px">分享链接给好友，他们打开就能加入：</p>
     <div class="share-bar">
       <code id="share-url"></code>
-      <button class="btn btn-sm" onclick="copyShare()">复制</button>
+      <button class="btn btn-sm" onclick="copyShare(this)">复制</button>
     </div>
   </div>
 
@@ -246,7 +246,7 @@
       <div id="tab-recs" style="display:none"></div>
       <div id="tab-pairs" style="display:none"></div>
     </div>
-    <button class="btn btn-primary" onclick="copyShare()" style="margin-top:12px">复制链接分享结果</button>
+    <button class="btn btn-primary" onclick="copyShare(this)" style="margin-top:12px">复制链接分享结果</button>
   </div>
 </div>
 
@@ -291,7 +291,7 @@ function showError(id, msg) {
 }
 
 function getShareUrl() {
-  return location.origin + location.pathname + '?s=' + encodeURIComponent(sessionId);
+  return location.origin + '/s/' + encodeURIComponent(sessionId);
 }
 
 function updateShareUrl() {
@@ -475,12 +475,31 @@ function switchTab(name) {
 }
 
 // ─── Copy ───
-function copyShare() {
-  navigator.clipboard.writeText(getShareUrl()).then(() => {
-    const btns = document.querySelectorAll('.btn-sm');
-    btns.forEach(b => b.textContent = '已复制');
-    setTimeout(() => btns.forEach(b => b.textContent = '复制'), 1500);
-  });
+async function copyShare(button) {
+  const url = getShareUrl();
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(url);
+    } else {
+      const input = document.createElement('textarea');
+      input.value = url;
+      input.style.position = 'fixed';
+      input.style.left = '-9999px';
+      document.body.appendChild(input);
+      input.focus();
+      input.select();
+      document.execCommand('copy');
+      input.remove();
+    }
+
+    if (button) {
+      const original = button.textContent;
+      button.textContent = '已复制';
+      setTimeout(() => { button.textContent = original; }, 1500);
+    }
+  } catch (e) {
+    alert('复制失败，请手动复制链接');
+  }
 }
 
 // ─── Utils ───
