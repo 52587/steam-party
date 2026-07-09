@@ -128,6 +128,23 @@ def player_top_games(player: dict, limit: int = 20) -> list[dict]:
     return games[:limit]
 
 
+def games_for_preference(game_dict: dict, max_count: int = 25) -> list[dict]:
+    games = list(game_dict.values())
+    games.sort(
+        key=lambda game: (game.get("hours", 0), game.get("hours_2weeks", 0)),
+        reverse=True,
+    )
+
+    filtered_games = [
+        game for game in games[5:]
+        if game.get("hours", 0) >= 1
+    ]
+    if len(filtered_games) < 10:
+        return games[:10]
+
+    return filtered_games[:max_count]
+
+
 def owned_game_names(players: dict[str, dict]) -> set[str]:
     names = set()
     for player in players.values():
@@ -148,16 +165,16 @@ def build_ai_prompt(players: dict[str, dict]) -> str:
     })
 
     for idx, player in enumerate(players.values(), start=1):
-        top_games = player_top_games(player, 20)
+        preference_games = games_for_preference(player.get("game_dict", {}))
         game_lines = [
             f"  - {game['name']}：{game.get('hours', 0)} 小时"
-            for game in top_games
+            for game in preference_games
         ]
         player_sections.append(
             "\n".join([
-                f"玩家 {idx}：{player['name']}",
+                f"玩家 {idx}：{player['name']}（steam_id: {player['steam_id']}）",
                 f"游戏总数：{player.get('game_count', len(player.get('game_dict', {})))}",
-                "最常玩的游戏：",
+                "用于偏好分析的游戏（已排除游玩时长最高的 5 款，并过滤少于 1 小时的游戏；小库玩家会回退到前 10 款）：",
                 *game_lines,
             ])
         )
@@ -168,7 +185,7 @@ def build_ai_prompt(players: dict[str, dict]) -> str:
 
     return f"""你是一个懂 Steam 多人游戏和合作游戏的中文游戏推荐专家。
 
-请基于以下玩家的 Steam 游戏库数据，分析每位玩家的偏好，包括常玩的类型、核心机制、游戏节奏、合作/竞技倾向、硬核程度和美术/叙事偏好。然后给整个小队推荐 5-8 款适合多人联机或合作游玩的 Steam 游戏。
+请基于以下玩家的 Steam 游戏库数据，先分析每位玩家的类型偏好，再给整个小队推荐 5-8 款适合多人联机或合作游玩的 Steam 游戏。
 
 重要限制：
 1. 推荐游戏必须适合多人联机、合作或同屏/线上多人游玩。
@@ -177,6 +194,8 @@ def build_ai_prompt(players: dict[str, dict]) -> str:
 4. 只返回合法 JSON，不要返回 Markdown，不要返回额外解释。
 5. match_score 必须是 0-100 的整数。
 6. match_desc 只能是以下四个值之一："完美匹配"、"非常匹配"、"比较匹配"、"还行"。
+7. 每位玩家的 preferences 是类型偏好百分比，value 必须是 0-100 的数字，同一玩家所有 value 总和约等于 100。
+8. 每位玩家返回 4-6 个最主要的偏好类型，type 用简短中文，例如“合作生存”“策略经营”“动作射击”“开放世界”“剧情探索”。
 
 玩家数据：
 {chr(10).join(player_sections)}
@@ -184,18 +203,32 @@ def build_ai_prompt(players: dict[str, dict]) -> str:
 已拥有游戏排除名单：
 {owned_list_for_prompt}
 
-请严格返回以下 JSON 数组结构：
-[
-  {{
-    "name": "Game Name",
-    "reason": "为什么要推荐这个游戏的详细理由",
-    "match_score": 85,
-    "match_desc": "非常匹配"
-  }}
-]"""
+请严格返回以下 JSON 对象结构：
+{{
+  "players": [
+    {{
+      "steam_id": "玩家 steam_id",
+      "name": "玩家名称",
+      "preferences": [
+        {{"type": "合作生存", "value": 35}},
+        {{"type": "动作射击", "value": 25}},
+        {{"type": "策略经营", "value": 20}},
+        {{"type": "剧情探索", "value": 20}}
+      ]
+    }}
+  ],
+  "recommendations": [
+    {{
+      "name": "Game Name",
+      "reason": "为什么要推荐这个游戏的详细理由",
+      "match_score": 85,
+      "match_desc": "非常匹配"
+    }}
+  ]
+}}"""
 
 
-def extract_json_array(content: str) -> list:
+def extract_ai_response(content: str) -> dict:
     text = content.strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -205,19 +238,162 @@ def extract_json_array(content: str) -> list:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
-    start = text.find("[")
-    end = text.rfind("]")
+    object_start = text.find("{")
+    object_end = text.rfind("}")
+    array_start = text.find("[")
+    array_end = text.rfind("]")
+
+    if (
+        array_start != -1
+        and array_end != -1
+        and array_end > array_start
+        and (object_start == -1 or array_start < object_start)
+    ):
+        start = array_start
+        end = array_end
+    elif object_start != -1 and object_end != -1 and object_end > object_start:
+        start = object_start
+        end = object_end
+    else:
+        raise ApiError("AI 返回内容不是有效的 JSON", 502)
+
+    json_text = text[start:end + 1]
     if start == -1 or end == -1 or end < start:
-        raise ApiError("AI 返回内容不是有效的 JSON 数组", 502)
+        raise ApiError("AI 返回内容不是有效的 JSON", 502)
 
     try:
-        parsed = json.loads(text[start:end + 1])
+        parsed = json.loads(json_text)
     except json.JSONDecodeError as exc:
         raise ApiError(f"AI 返回 JSON 解析失败: {exc}", 502) from exc
 
-    if not isinstance(parsed, list):
-        raise ApiError("AI 返回内容不是推荐列表", 502)
-    return parsed
+    if isinstance(parsed, list):
+        return {"players": [], "recommendations": parsed}
+    if isinstance(parsed, dict):
+        recommendations = parsed.get("recommendations", [])
+        players = parsed.get(
+            "players",
+            parsed.get("player_preferences", parsed.get("preferences", [])),
+        )
+        return {"players": players, "recommendations": recommendations}
+
+    raise ApiError("AI 返回内容不是推荐对象", 502)
+
+
+def normalize_preference_items(raw_items) -> list[dict]:
+    if isinstance(raw_items, dict):
+        iterable = [
+            {"type": key, "value": value}
+            for key, value in raw_items.items()
+        ]
+    elif isinstance(raw_items, list):
+        iterable = raw_items
+    else:
+        return []
+
+    preferences = []
+    for item in iterable:
+        if not isinstance(item, dict):
+            continue
+
+        type_name = str(
+            item.get("type")
+            or item.get("genre")
+            or item.get("name")
+            or item.get("label")
+            or ""
+        ).strip()
+        if not type_name:
+            continue
+
+        raw_value = (
+            item.get("value")
+            if "value" in item
+            else item.get("percentage", item.get("percent", item.get("score", 0)))
+        )
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            value = 0
+        value = max(0, min(100, value))
+        if value <= 0:
+            continue
+
+        preferences.append({
+            "type": type_name[:24],
+            "value": value,
+        })
+
+    preferences.sort(key=lambda item: item["value"], reverse=True)
+    preferences = preferences[:6]
+    total = sum(item["value"] for item in preferences)
+    if total <= 0:
+        return []
+
+    normalized = []
+    running_total = 0
+    for index, item in enumerate(preferences):
+        if index == len(preferences) - 1:
+            value = max(0, 100 - running_total)
+        else:
+            value = int(round(item["value"] / total * 100))
+            running_total += value
+        normalized.append({
+            "type": item["type"],
+            "value": value,
+        })
+
+    return [item for item in normalized if item["value"] > 0]
+
+
+def normalize_ai_preferences(raw_players, players: dict[str, dict]) -> list[dict]:
+    if isinstance(raw_players, dict):
+        converted_players = []
+        for key, value in raw_players.items():
+            if isinstance(value, dict):
+                player_value = dict(value)
+                if key in players:
+                    player_value.setdefault("steam_id", key)
+                else:
+                    player_value.setdefault("name", key)
+                converted_players.append(player_value)
+        raw_players = converted_players
+    elif not isinstance(raw_players, list):
+        raw_players = []
+
+    raw_by_id = {}
+    raw_by_name = {}
+    for raw_player in raw_players:
+        if not isinstance(raw_player, dict):
+            continue
+        steam_id = str(raw_player.get("steam_id", "")).strip()
+        name = str(raw_player.get("name", "")).strip().lower()
+        if steam_id:
+            raw_by_id[steam_id] = raw_player
+        if name:
+            raw_by_name[name] = raw_player
+
+    normalized_players = []
+    for player in players.values():
+        raw_player = raw_by_id.get(player["steam_id"]) or raw_by_name.get(player["name"].strip().lower()) or {}
+        raw_preferences = (
+            raw_player.get("preferences")
+            or raw_player.get("type_preferences")
+            or raw_player.get("genres")
+            or []
+        )
+        preferences = normalize_preference_items(raw_preferences)
+        if not preferences:
+            continue
+
+        normalized_players.append({
+            "steam_id": player["steam_id"],
+            "name": player["name"],
+            "avatar": player.get("avatar", ""),
+            "game_count": player.get("game_count", len(player.get("game_dict", {}))),
+            "preferences": preferences,
+        })
+
+    return normalized_players
 
 
 def normalize_ai_recommendations(raw_items: list, owned_names: set[str]) -> list[dict]:
@@ -276,7 +452,7 @@ def next_ai_temperature(session: dict) -> float:
     return temperature
 
 
-async def generate_ai_recommendations(session: dict, temperature: float = 0.7) -> list[dict]:
+async def generate_ai_recommendations(session: dict, temperature: float = 0.7) -> dict:
     if not is_deepseek_configured():
         raise ApiError("DeepSeek API Key 未配置，请在环境变量 DEEPSEEK_API_KEY 中设置后重试。", 503)
 
@@ -295,7 +471,7 @@ async def generate_ai_recommendations(session: dict, temperature: float = 0.7) -
             {"role": "user", "content": prompt},
         ],
         "temperature": temperature,
-        "max_tokens": 1800,
+        "max_tokens": 2600,
     }
 
     connection_errors = []
@@ -344,11 +520,18 @@ async def generate_ai_recommendations(session: dict, temperature: float = 0.7) -
     if not content:
         raise ApiError("DeepSeek API 没有返回推荐内容", 502)
 
-    raw_recommendations = extract_json_array(content)
-    recommendations = normalize_ai_recommendations(raw_recommendations, owned_game_names(players))
+    raw_ai_response = extract_ai_response(content)
+    preferences = normalize_ai_preferences(raw_ai_response.get("players", []), players)
+    recommendations = normalize_ai_recommendations(
+        raw_ai_response.get("recommendations", []),
+        owned_game_names(players),
+    )
     if not recommendations:
         raise ApiError("AI 没有生成可用的未拥有游戏推荐，请重试。", 502)
-    return recommendations
+    return {
+        "preferences": preferences,
+        "recommendations": recommendations,
+    }
 
 
 async def resolve_steam_id(raw: str) -> str:
@@ -601,6 +784,7 @@ async def handle_api(method: str, path: str, query: dict[str, list[str]], body: 
                 "locked": session.get("locked", False),
                 "has_results": "results" in session,
                 "has_ai_recommendations": bool(session.get("ai_recommendations")),
+                "has_ai_preferences": bool(session.get("ai_preferences")),
             }
 
         if method == "POST" and path.startswith("/api/session/") and path.endswith("/analyze"):
@@ -630,16 +814,20 @@ async def handle_api(method: str, path: str, query: dict[str, list[str]], body: 
             }
             if refresh:
                 session.pop("ai_recommendations", None)
+                session.pop("ai_preferences", None)
 
             if "ai_recommendations" not in session:
                 temperature = next_ai_temperature(session)
-                session["ai_recommendations"] = await generate_ai_recommendations(
+                ai_response = await generate_ai_recommendations(
                     session,
                     temperature=temperature,
                 )
+                session["ai_preferences"] = ai_response.get("preferences", [])
+                session["ai_recommendations"] = ai_response.get("recommendations", [])
 
             return 200, {
                 "status": "ok",
+                "players": session.get("ai_preferences", []),
                 "recommendations": session["ai_recommendations"],
             }
 
@@ -653,7 +841,21 @@ async def handle_api(method: str, path: str, query: dict[str, list[str]], body: 
 
             return 200, {
                 "status": "ok",
+                "players": session.get("ai_preferences", []),
                 "recommendations": session["ai_recommendations"],
+            }
+
+        if method == "GET" and path.startswith("/api/session/") and path.endswith("/ai-preferences"):
+            session_id = path.split("/")[3]
+            session = SESSIONS.get(session_id)
+            if not session:
+                raise ApiError("Session not found", 404)
+            if "ai_preferences" not in session:
+                raise ApiError("No AI preferences yet", 404)
+
+            return 200, {
+                "status": "ok",
+                "players": session["ai_preferences"],
             }
 
         if method == "GET" and path.startswith("/api/session/") and path.endswith("/results"):

@@ -174,6 +174,35 @@
   .score-low { background: linear-gradient(90deg, #e05555, #ee8b71) }
   .ai-reason { color: #cfcfe6; font-size: 0.9em; line-height: 1.65 }
 
+  /* Member preferences */
+  .pref-list { display: grid; gap: 12px }
+  .pref-card {
+    background: var(--chip); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px;
+  }
+  .pref-player {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+  }
+  .pref-player img {
+    width: 36px; height: 36px; border-radius: 50%; flex: 0 0 auto;
+  }
+  .pref-name { font-weight: 700; font-size: 0.95em }
+  .pref-count { color: var(--muted); font-size: 0.8em; margin-top: 2px }
+  .pref-bars { display: grid; gap: 8px }
+  .pref-row {
+    display: grid; grid-template-columns: minmax(72px, 112px) 1fr 42px;
+    align-items: center; gap: 10px; font-size: 0.85em;
+  }
+  .pref-type {
+    color: #d9d9ee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pref-track {
+    height: 8px; border-radius: 999px; overflow: hidden;
+    background: rgba(255,255,255,0.08);
+  }
+  .pref-fill { height: 100%; border-radius: inherit }
+  .pref-value { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums }
+
   /* Pair cards */
   .pair-card {
     background: var(--chip); border-radius: var(--radius); padding: 14px; margin-bottom: 10px;
@@ -198,6 +227,7 @@
     .card { padding: 16px }
     .header h1 { font-size: 1.6em }
     .game-row { flex-direction: column; align-items: flex-start; gap: 2px }
+    .pref-row { grid-template-columns: 82px 1fr 38px; gap: 8px }
   }
 </style>
 </head>
@@ -264,15 +294,13 @@
   <!-- === RESULTS === -->
   <div id="step-results" style="display:none">
     <div class="tabs">
-      <div class="tab active" data-tab="common" onclick="switchTab('common')">共同游戏</div>
+      <div class="tab active" data-tab="prefs" onclick="switchTab('prefs')">成员偏好</div>
       <div class="tab" data-tab="recs" onclick="switchTab('recs')">推荐补票</div>
-      <div class="tab" data-tab="pairs" onclick="switchTab('pairs')">双人交集</div>
       <div class="tab" data-tab="ai" onclick="switchTab('ai')">AI推荐</div>
     </div>
     <div class="card" style="border-top:none;border-radius:0 0 var(--radius) var(--radius)">
-      <div id="tab-common"></div>
+      <div id="tab-prefs"></div>
       <div id="tab-recs" style="display:none"></div>
-      <div id="tab-pairs" style="display:none"></div>
       <div id="tab-ai" style="display:none"></div>
     </div>
     <button class="btn btn-primary" onclick="copyShare(this)" style="margin-top:12px">复制链接分享结果</button>
@@ -284,6 +312,7 @@
 let sessionId = null;
 let results = null;
 let pollTimer = null;
+let aiPreferences = null;
 let aiRecommendations = null;
 let aiLoading = false;
 let aiError = '';
@@ -336,6 +365,7 @@ function updateShareUrl() {
 
 function resetAiState() {
   clearAiAutoRetryTimer();
+  aiPreferences = null;
   aiRecommendations = null;
   aiLoading = false;
   aiError = '';
@@ -473,11 +503,7 @@ function renderResults() {
   document.getElementById('step-players').style.display = 'block';
   if (pollTimer) clearInterval(pollTimer);
 
-  // Common games
-  const common = results.common_games || [];
-  document.getElementById('tab-common').innerHTML = common.length
-    ? common.map(g => '<div class="game-row"><span class="gname">' + escapeHtml(g.name) + '</span><span class="gmeta">' + Math.round(g.total_hours) + 'h</span></div>').join('')
-    : '<div class="empty">没有所有人都拥有的游戏</div>';
+  renderPreferencesTab();
 
   // Recommendations
   const recs = results.recommendations || [];
@@ -491,26 +517,6 @@ function renderResults() {
       ).join('')
     : '<div class="empty">没有补票建议</div>';
 
-  // Pair overlaps
-  const pairs = results.pair_overlaps || [];
-  document.getElementById('tab-pairs').innerHTML = pairs.length
-    ? pairs.map(pair =>
-        '<div class="pair-card">' +
-        '<div class="pair-header">' +
-        (pair.p1.avatar ? '<img src="' + escapeHtml(pair.p1.avatar) + '" onerror="this.style.display=\'none\'">' : '') +
-        '<strong>' + escapeHtml(pair.p1.name) + '</strong>' +
-        '<span style="color:var(--muted)">+</span>' +
-        (pair.p2.avatar ? '<img src="' + escapeHtml(pair.p2.avatar) + '" onerror="this.style.display=\'none\'">' : '') +
-        '<strong>' + escapeHtml(pair.p2.name) + '</strong>' +
-        '<span class="count">(' + pair.shared_count + ' 共同)</span>' +
-        '</div>' +
-        pair.top_shared.map(g =>
-          '<div class="game-row"><span class="gname">' + escapeHtml(g.name) + '</span><span class="gmeta">' + Math.round(g.p1_hours) + 'h / ' + Math.round(g.p2_hours) + 'h</span></div>'
-        ).join('') +
-        '</div>'
-      ).join('')
-    : '<div class="empty">无数据</div>';
-
   renderAiTab();
   loadCachedAiRecommendations();
 }
@@ -521,11 +527,13 @@ async function loadCachedAiRecommendations() {
   aiCacheChecked = true;
   try {
     const data = await api('GET', '/api/session/' + sessionId + '/ai-recommendations');
+    aiPreferences = data.players || [];
     aiRecommendations = data.recommendations || [];
     aiError = '';
   } catch (e) {
     // 404 just means the session has no cached AI result yet.
   }
+  renderPreferencesTab();
   renderAiTab();
 }
 
@@ -538,11 +546,13 @@ async function requestAiRecommendations() {
   aiLastRequestRefresh = refresh;
   aiLoading = true;
   aiError = '';
+  renderPreferencesTab();
   renderAiTab();
 
   try {
     const path = '/api/session/' + sessionId + '/ai-recommend' + (refresh ? '?refresh=true' : '');
     const data = await api('POST', path);
+    aiPreferences = data.players || [];
     aiRecommendations = data.recommendations || [];
     aiCacheChecked = true;
   } catch (e) {
@@ -552,11 +562,13 @@ async function requestAiRecommendations() {
     } else {
       aiError = e.message;
     }
+    renderPreferencesTab();
     renderAiTab();
     return;
   }
 
   aiLoading = false;
+  renderPreferencesTab();
   renderAiTab();
 }
 
@@ -569,6 +581,7 @@ function clearAiAutoRetryTimer() {
 function scheduleAiAutoRetry(refresh) {
   aiError = '';
   aiAutoRetrySeconds = 3;
+  renderPreferencesTab();
   renderAiTab();
   aiAutoRetryTimer = setInterval(() => {
     aiAutoRetrySeconds -= 1;
@@ -576,9 +589,60 @@ function scheduleAiAutoRetry(refresh) {
       clearAiAutoRetryTimer();
       requestAiRecommendations({ refresh, autoRetry: false });
     } else {
+      renderPreferencesTab();
       renderAiTab();
     }
   }, 1000);
+}
+
+function renderPreferencesTab() {
+  const el = document.getElementById('tab-prefs');
+  if (!el) return;
+
+  const prefs = aiPreferences || [];
+  if (aiLoading && !prefs.length) {
+    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" disabled><span class="spinner"></span> AI 正在分析偏好...</button></div>';
+    return;
+  }
+
+  if (aiAutoRetrySeconds > 0 && !prefs.length) {
+    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" disabled>连接中，请稍候... ' + aiAutoRetrySeconds + ' 秒后自动重试</button></div>';
+    return;
+  }
+
+  if (aiError && !prefs.length) {
+    el.innerHTML =
+      '<div class="error-msg" style="display:block;margin-top:0">' + escapeHtml(aiError) + '</div>' +
+      '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations({ refresh: aiLastRequestRefresh })">重试 AI 分析</button></div>';
+    return;
+  }
+
+  if (!prefs.length) {
+    el.innerHTML = '<div class="ai-actions"><button class="btn btn-primary" onclick="requestAiRecommendations()">使用AI智能推荐分析偏好</button></div>';
+    return;
+  }
+
+  el.innerHTML = '<div class="pref-list">' + prefs.map(player => {
+    const rows = (player.preferences || []).map((pref, index) => {
+      const value = clampScore(pref.value);
+      return '<div class="pref-row">' +
+        '<div class="pref-type" title="' + escapeHtml(pref.type || '') + '">' + escapeHtml(pref.type || '') + '</div>' +
+        '<div class="pref-track"><div class="pref-fill" style="width:' + value + '%;background:' + preferenceColor(index) + '"></div></div>' +
+        '<div class="pref-value">' + value + '%</div>' +
+        '</div>';
+    }).join('');
+
+    return '<div class="pref-card">' +
+      '<div class="pref-player">' +
+      (player.avatar ? '<img src="' + escapeHtml(player.avatar) + '" onerror="this.style.display=\'none\'">' : '') +
+      '<div>' +
+      '<div class="pref-name">' + escapeHtml(player.name || '玩家') + '</div>' +
+      '<div class="pref-count">' + (player.game_count || '?') + ' 游戏</div>' +
+      '</div>' +
+      '</div>' +
+      '<div class="pref-bars">' + rows + '</div>' +
+      '</div>';
+  }).join('') + '</div>';
 }
 
 function renderAiTab() {
@@ -640,11 +704,10 @@ function renderAiTab() {
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelector('[data-tab="' + name + '"]').classList.add('active');
-  document.getElementById('tab-common').style.display = name === 'common' ? 'block' : 'none';
+  document.getElementById('tab-prefs').style.display = name === 'prefs' ? 'block' : 'none';
   document.getElementById('tab-recs').style.display = name === 'recs' ? 'block' : 'none';
-  document.getElementById('tab-pairs').style.display = name === 'pairs' ? 'block' : 'none';
   document.getElementById('tab-ai').style.display = name === 'ai' ? 'block' : 'none';
-  if (name === 'ai') loadCachedAiRecommendations();
+  if (name === 'ai' || name === 'prefs') loadCachedAiRecommendations();
 }
 
 // ─── Copy ───
@@ -686,6 +749,11 @@ function clampScore(value) {
   const score = parseInt(value, 10);
   if (Number.isNaN(score)) return 0;
   return Math.max(0, Math.min(100, score));
+}
+
+function preferenceColor(index) {
+  const colors = ['#4caf84', '#667eea', '#e0ad4f', '#e05555', '#4fb6c8', '#b96bdc'];
+  return colors[index % colors.length];
 }
 </script>
 </body>
